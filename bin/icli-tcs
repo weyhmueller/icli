@@ -112,7 +112,7 @@ sub pretty_noyes {
 sub pretty_yesno {
   my ($bool) = @_;
   return (
-  $bool
+    $bool
     ? with_colour( 'YES', 'black on_green' )
     : with_colour( 'NO',  'white on_red' )
   );
@@ -427,10 +427,10 @@ sub service_state {
   }
 
   given ($digit) {
-    when (0) { return with_colour( '   OK   ', 'black on_green' ) }
-    when (1) { return with_colour( ' WARNING', 'black on_yellow' ) }
-    when (2) { return with_colour( 'CRITICAL', 'white on_red' ) }
-    when (3) { return with_colour( ' UNKNOWN', 'white on_blue' ) }
+    when (0) { return with_colour( '  OK  ', 'black on_green' ) }
+    when (1) { return with_colour( ' WARN ', 'black on_yellow' ) }
+    when (2) { return with_colour( ' CRIT ', 'white on_red' ) }
+    when (3) { return with_colour( ' UNKN ', 'white on_blue' ) }
     default  { croak("Unknown service state: $digit\n") }
   }
 }
@@ -552,6 +552,7 @@ sub display_x_verbose {
       printf( $format, q{}, break_str( $line, 19 ), );
     }
     printf( $format, 'Performance Data', $x->{'performance_data'}, );
+    printf( $format, 'Priority', substr $x->{'_TCS3_PRIORITY'},2);
     printf( "%-16s : %d/%d\n",
       'Current Attempt',
       $x->{'current_attempt'},
@@ -635,11 +636,12 @@ sub display_service {
 
   if ( $v < 3 ) {
 
-    $n_width = 20 + 8 + 2;
+    $n_width = 20 + 25 + 8 + 2;
     if ($tab) {
       $n_width += 8;
     }
 
+    printf( '%-25.25s', $s->{host_name} );
     printf( '%-20.20s', $s->{service_description} );
 
     if ( $v >= 2 ) {
@@ -680,6 +682,9 @@ sub display_service {
     }
 
     print ' ';
+    printf( '%-6.6s', substr $s->{'_TCS3_PRIORITY'},2);
+    $n_width += 7;
+    print ' ';
 
     print break_str( $s->{plugin_output}, $n_width );
 
@@ -700,25 +705,23 @@ sub display_host_services {
 
   if ( $all and @services and $verbosity < 3 ) {
 
-    print "\n$host";
-
     if ( $h->{'current_state'} ) {
+      print "\n$host";
       print q{ };
+      if ( $h->{'current_state'} == 1 ) {
+        print with_colour( 'DOWN', 'white on_red' );
+      }
+      elsif ( $h->{'current_state'} == 2 ) {
+        print with_colour( 'UNREACHABLE', 'white on_blue' );
+      }
+      print "\n";
     }
-    if ( $h->{'current_state'} == 1 ) {
-      print with_colour( 'DOWN', 'white on_red' );
-    }
-    elsif ( $h->{'current_state'} == 2 ) {
-      print with_colour( 'UNREACHABLE', 'white on_blue' );
-    }
-
-    print "\n";
   }
 
   foreach my $service (@services) {
 
     if ( $all and $verbosity < 3 ) {
-      print "\t";
+      print "";
     }
     elsif ($all) {
       print "\n";
