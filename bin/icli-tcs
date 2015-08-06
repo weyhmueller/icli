@@ -2,38 +2,47 @@
 ## Copyright © 2010-2012 by Daniel Friesel <derf@finalrewind.org>
 ## License: WTFPL <http://sam.zoy.org/wtfpl>
 ##   0. You just DO WHAT THE FUCK YOU WANT TO.
-use autodie;
 use strict;
 use warnings;
 use 5.010;
 
+no if $] >= 5.018, warnings => 'experimental::smartmatch';
+
+use App::Icli::ConfigData;
 use Carp qw(croak);
-use Date::Format;
+use DateTime;
+use DateTime::Format::Strptime;
+use DateTime::TimeZone;
 use Getopt::Long qw/:config bundling/;
+use JSON;
 use List::MoreUtils qw(any firstval);
+use LWP::UserAgent;
+use Net::Netrc;
+use POSIX qw(strftime);
 use Term::ANSIColor;
 use Term::Size;
 use Data::Dumper;
 
-our $VERSION = '0.43';
+our $VERSION = '0.48';
 
 my ( $cache, $config, $data, $extra );
-my $config_file = '/var/cache/icinga/objects.cache';
-my $status_file = '/var/lib/icinga/status.dat';
-my $rw_file     = '/var/lib/icinga/rw/icinga.cmd';
+my $config_file = App::Icli::ConfigData->config('object_file');
+my $status_file = App::Icli::ConfigData->config('status_file');
+my $rw_file     = App::Icli::ConfigData->config('command_file');
+my ( $api1_root, $ua );
+my $realm = 'Icinga Access';
 my $context;
-my $colours       = 1;
-my $list_type     = 's';
-my $verbosity     = 1;
-my $overview      = 0;
-my $recheck       = 0;
-my $force_recheck = 0;
-my $match_output  = undef;
-my $acknowledge   = undef;
-my $as_contact    = undef;
-my $term_width    = Term::Size::chars();
-my $cut_mode      = 'b';
+my $colours      = 1;
+my $list_type    = 's';
+my $verbosity    = 1;
+my $overview     = 0;
+my $match_output = undef;
+my $action       = undef;
+my $as_contact   = undef;
+my $term_width   = Term::Size::chars();
+my $cut_mode     = 'b';
 my ( @for_hosts, @for_groups, @for_services, @list_hosts, @list_services );
+my @action_args;
 my @filters;
 
 sub have_host {
@@ -85,7 +94,7 @@ sub pretty_date {
     return 'never';
   }
 
-  return time2str( '%Y-%m-%d %H:%M:%S', $unix );
+  return strftime( '%Y-%m-%d %H:%M:%S', localtime($unix) );
 }
 
 sub pretty_duration {
@@ -93,11 +102,39 @@ sub pretty_duration {
   my $now     = time();
   my $dif     = $now - $since;
 
+  return pretty_duration_abs($dif);
+}
+
+sub pretty_duration_abs {
+  my ($dif) = @_;
+
   return sprintf( '%dd %dh %dm %ds',
     int( $dif / ( 24 * 3600 ) ),
     int( ( $dif / 3600 ) % 24 ),
     int( ( $dif / 60 ) % 60 ),
     $dif % 60, );
+}
+
+sub parse_duration {
+  my ($raw) = @_;
+
+  my %factors = (
+    s => 1,
+    m => 60,
+    h => 3_600,
+    d => 86_400,
+    w => 604_800,
+  );
+
+  $raw =~ m{ ^ (?<value> [.0-9]+ ) \s* (?<unit> [mhdw] )? $ }x
+    or die(
+"Cannot parse '$raw' - must be a duration like '50s', '2m', '10h' or '1d'"
+    );
+
+  if ( $+{unit} ) {
+    return $+{value} * $factors{ $+{unit} };
+}
+  return $+{value};
 }
 
 sub pretty_noyes {
@@ -119,21 +156,62 @@ sub pretty_yesno {
 }
 
 sub pretty_state {
-  my ($count, $state) = @_;
-  my $ret;
+  my ( $count, $state ) = @_;
   my $colour;
 
   given ($state) {
-    when ('ok') { $colour = 'black on_green' }
-    when ('warning') { $colour = 'black on_yellow' }
+    when ('ok')       { $colour = 'black on_green' }
+    when ('warning')  { $colour = 'black on_yellow' }
     when ('critical') { $colour = 'white on_red' }
-    when ('unknown') { $colour = 'white on_blue' }
+    when ('unknown')  { $colour = 'white on_blue' }
   }
 
-  if ($count == 0) {
+  if ( $count == 0 ) {
     return q{    };
   }
-  return with_colour(sprintf('%4d', $count), $colour);
+  if ($colour) {
+    return with_colour( sprintf( '%4d', $count ), $colour );
+  }
+  return sprintf( '%4d', $count );
+  }
+
+sub setup_ua {
+  my ($url) = @_;
+  my $m;
+
+  $url =~ m{
+    ^ 
+    (?: (?<proto> [^:]+ ) :// )?
+    (?: (?<user> [^@]+ ) @ )?
+    (?<host> [^:/@]+ )
+    (?: : (?<port> \d++ ) )?
+    (?<url> .* )
+    $
+  }x
+    or die( "Cannot parse API url '$url'\n"
+      . "This may be a bug. If you think so, please report it\n" );
+
+  my $proto = $+{proto} // 'http';
+  my $host  = $+{host};
+  my $port  = $+{port} // ( $proto eq 'http' ? 80 : 443 );
+
+  if ( $+{user} ) {
+    $as_contact = $+{user};
+}
+
+  my $netrc_name = "$host:$port";
+
+  $ua = LWP::UserAgent->new( timeout => 5 );
+
+  $m = Net::Netrc->lookup( $netrc_name, $as_contact )
+    or warn( "Cannot find an entry for '$netrc_name' "
+      . ( $as_contact ? "with login '$as_contact' " : q{} )
+      . "in ~/.netrc\n" );
+
+  if ($m) {
+    $ua->credentials( $netrc_name, $realm, $m->login, $m->password );
+  }
+  $ua->env_proxy;
 }
 
 sub split_by_words {
@@ -166,7 +244,7 @@ sub split_by_words {
       )
     {
       if ($tr_space) {
-        $cur_str .= ' ';
+        $cur_str .= q{ };
       }
       else {
         $tr_space = 1;
@@ -174,7 +252,7 @@ sub split_by_words {
       $cur_str .= shift(@words);
     }
     if (@ret) {
-      $cur_str = ( ' ' x $padding ) . $cur_str;
+      $cur_str = ( q{ } x $padding ) . $cur_str;
     }
     push( @ret, $cur_str );
   }
@@ -219,7 +297,7 @@ sub filter_generic {
   my ($x) = @_;
   my $filters_unfulfilled = @filters;
 
-  if ($match_output and not $x->{plugin_output} =~ $match_output) {
+  if ( $match_output and not $x->{plugin_output} =~ $match_output ) {
     return 0;
   }
 
@@ -231,14 +309,21 @@ sub filter_generic {
       or ( $f eq '!D' and not check_is_host_down($x) )
       or ( $f eq 'F'  and $x->{'is_flapping'} )
       or ( $f eq '!F' and not $x->{'is_flapping'} )
+      or ( $f eq 'N'  and not $x->{'notifications_enabled'} )
+      or ( $f eq '!N' and $x->{'notifications_enabled'} )
       or (    $f eq 'P'
         and $x->{'passive_checks_enabled'}
         and not $x->{'active_checks_enabled'} )
       or ( $f eq '!P' and $x->{'active_checks_enabled'} )
       or ( $f eq 'S'  and check_is_soft($x) )
       or ( $f eq '!S' and not check_is_soft($x) )
+      or ( $f eq 'p'  and $x->{'has_been_checked'} == 0 )
+      or ( $f eq '!p' and $x->{'has_been_checked'} != 0 )
       or ( $f eq 'o'  and $x->{'current_state'} == 0 )
-      or ( $f eq '!o' and $x->{'current_state'} != 0 )
+      or ( $f eq '!o'
+        and
+        ( $x->{'current_state'} != 0 or $x->{'has_been_checked'} == 0 )
+      )
       or ( $f eq 'w'  and $x->{'current_state'} == 1 )
       or ( $f eq '!w' and $x->{'current_state'} != 1 )
       or ( $f eq 'c'  and $x->{'current_state'} == 2 )
@@ -272,6 +357,13 @@ sub filter_host {
     return 0;
   }
 
+  if (    $as_contact
+    and not host_has_contact( $h, $as_contact )
+    and not $api1_root )
+  {
+    return 0;
+  }
+
   return 1;
 }
 
@@ -288,20 +380,115 @@ sub filter_service {
     return 0;
   }
 
-  if ($as_contact and not has_contact($s, $as_contact)) {
+  if (    $as_contact
+    and not service_has_contact( $s, $as_contact )
+    and not $api1_root )
+  {
     return 0;
   }
 
   return 1;
 }
 
-sub has_contact {
-  my ($s, $contact) = @_;
+sub host_has_contact {
+  my ( $h, $contact ) = @_;
 
-  my $conf_s = firstval { $_->{service_description} eq $s->{service_description } }
-    @{ $config->{services}{$s->{host_name}}};
+  my $conf_h = $config->{hosts}{ $h->{host_name} };
 
-  return any { $_ eq $contact } @{$conf_s->{contacts}};
+  return any { $_ eq $contact } @{ $conf_h->{contacts} };
+}
+
+sub service_has_contact {
+  my ( $s, $contact ) = @_;
+
+  my $conf_s
+    = firstval { $_->{service_description} eq $s->{service_description} }
+  @{ $config->{services}{ $s->{host_name} } };
+
+  return any { $_ eq $contact } @{ $conf_s->{contacts} };
+}
+
+sub read_json {
+  my ( $res, $ref ) = @_;
+
+  my %statusmap = (
+    OK          => 0,
+    WARNING     => 1,
+    CRITICAL    => 2,
+    UNKNOWN     => 3,
+    UP          => 0,
+    DOWN        => 1,
+    UNREACHABLE => 2,
+    PENDING     => 0,
+  );
+
+  my $json = from_json( $res->decoded_content );
+
+  if ( $json->{config}->{error} ) {
+    warn( 'While reading ' . $res->request->uri . ":\n" );
+    warn( 'JSON API Error: ' . $json->{config}->{error}->{title} . "\n" );
+    warn( '                ' . $json->{config}->{error}->{text} . "\n" );
+  }
+
+  if ( $json->{config}->{hosts} ) {
+    for my $host ( @{ $json->{config}->{hosts} } ) {
+      ${$ref}->{hosts}->{ $host->{host_name} } = $host;
+    }
+  }
+  if ( $json->{config}->{hostgroups} ) {
+    for my $group ( @{ $json->{config}->{hostgroups} } ) {
+      ${$ref}->{hostgroups}->{ $group->{group_name} } = $group;
+    }
+  }
+  if ( $json->{config}->{services} ) {
+    for my $service ( @{ $json->{config}->{services} } ) {
+      push(
+        @{ ${$ref}->{services}->{ $service->{host_name} } },
+        $service
+      );
+    }
+  }
+  if ( $json->{config}->{servicegroups} ) {
+    for my $group ( @{ $json->{config}->{servicegroups} } ) {
+      ${$ref}->{servicegroups}->{ $group->{group_name} } = $group;
+    }
+}
+
+  if ( $json->{status}->{host_status} ) {
+    for my $host ( @{ $json->{status}->{host_status} } ) {
+
+      $host->{has_been_checked}
+        = ( $host->{status} eq 'PENDING' ? 0 : 1 );
+      $host->{current_state}      = $statusmap{ $host->{status} };
+      $host->{plugin_output}      = $host->{status_information};
+      $host->{long_plugin_output} = q{};
+      $host->{performance_data}   = q{};
+
+      ( $host->{current_attempt}, $host->{max_attempts} )
+        = split( '/', $host->{attempts} );
+
+      ${$ref}->{hosts}->{ $host->{host_name} } = $host;
+  }
+}
+  if ( $json->{status}->{service_status} ) {
+    for my $service ( @{ $json->{status}->{service_status} } ) {
+
+      $service->{has_been_checked}
+        = ( $service->{status} eq 'PENDING' ? 0 : 1 );
+      $service->{current_state}      = $statusmap{ $service->{status} };
+      $service->{plugin_output}      = $service->{status_information};
+      $service->{long_plugin_output} = q{};
+      $service->{performance_data}   = q{};
+
+      ( $service->{current_attempt}, $service->{max_attempts} )
+        = split( '/', $service->{attempts} );
+
+      push(
+        @{ ${$ref}->{services}->{ $service->{host_name} } },
+        $service
+      );
+    }
+  }
 }
 
 sub read_objects_line {
@@ -344,12 +531,10 @@ sub read_objects_line {
           = $cache;
       }
       when ('hostcomment') {
-
-        # TODO
+        push( @{ ${$ref}->{hostcomments} }, $cache );
       }
       when ('servicecomment') {
-
-        # TODO
+        push( @{ ${$ref}->{servicecomments} }, $cache );
       }
       when ('host') {
         ${$ref}->{hosts}->{ $cache->{host_name} } = $cache;
@@ -362,13 +547,13 @@ sub read_objects_line {
       }
       when ('contactgroup') {
         ${$ref}->{contactgroups}->{ $cache->{contactgroup_name} }
-          = [split(m{, *}, $cache->{members})];
+          = [ split( m{, *}, $cache->{members} // q{} ) ];
       }
       when (
         [
           qw[
             timeperiod command contactgroup contact host service
-            servicedependency hostdependency hostescalation serviceescalation
+            servicedependency serviceescalation module hostdependency hostescalation
             ]
         ]
         )
@@ -385,60 +570,160 @@ sub read_objects_line {
 }
 
 sub read_objects {
-  my ( $file, $ref ) = @_;
+  my ( $file, $ref, $description, $opt ) = @_;
 
-  open( my $fh, '<', $file );
+  open( my $fh, '<', $file )
+    or die( "Failed to read $description ($file): $!\n"
+      . "Set $opt to change it\n" );
+
   while ( my $line = <$fh> ) {
     chomp($line);
     read_objects_line( $line, $ref );
   }
-  close($fh);
+
+  close($fh)
+    or warn("Failed to close $description ($file): $!\n");
 }
 
 sub enhance_status {
+  for my $c ( @{ $data->{servicecomments} } ) {
+    my $service
+      = firstval { $_->{service_description} eq $c->{service_description} }
+    @{ $data->{services}->{ $c->{host_name} } };
+    push( @{ $service->{comments} }, $c );
+  }
+  for my $c ( @{ $data->{hostcomments} } ) {
+    push( @{ $data->{hosts}->{ $c->{host_name} }->{comments} }, $c );
+  }
   HOST: for my $h ( keys %{ $data->{services} } ) {
     for my $s ( @{ $data->{services}->{$h} } ) {
       if ( $s->{current_state} != 0 ) {
         $extra->{$h}->{service_problem} = 1;
         next HOST;
+  for my $h ( values %{ $config->{hosts} } ) {
+      }
       }
     }
+    if ( $h->{contacts} ) {
+      $h->{contacts} =~ s{^ *}{}o;
+      $h->{contacts} = [ split( m{, *}, $h->{contacts} ) ];
+  }
   }
   HOST: for my $h ( keys %{ $config->{services} } ) {
     for my $s ( @{ $config->{services}->{$h} } ) {
-      if ($s->{contacts}) {
+      if ( $s->{contacts} ) {
         $s->{contacts} =~ s{^ *}{}o;
-        $s->{contacts} = [split(m{, *}, $s->{contacts})];
+        $s->{contacts} = [ split( m{, *}, $s->{contacts} ) ];
       }
-      for my $group (split(m{, *}, $s->{contact_groups})) {
-        push(@{$s->{contacts}}, @{$config->{contactgroups}{$group}});
+      if ( $s->{contact_groups} ) {
+        for my $group ( split( m{, *}, $s->{contact_groups} ) ) {
+          push(
+            @{ $s->{contacts} },
+            @{ $config->{contactgroups}{$group} }
+          );
+        }
       }
     }
   }
 }
 
+sub parse_action {
+  if ( not $action ) {
+    return;
+  }
+
+  my @raw_args;
+
+  my %actionmap = (
+    a => 'acknowledge',
+    d => 'downtime',
+    r => 'recheck',
+    R => 'force_recheck',
+  );
+
+  ( $action, @raw_args ) = split( /:/, $action );
+  @action_args = split( /,/, join( ':', @raw_args ) );
+  $list_type = q{};
+
+  if ( exists $actionmap{$action} ) {
+    $action = $actionmap{$action};
+  }
+  elsif ( length($action) <= 2 ) {
+    say STDERR "Note: Action shortcut '${action}' is unknown";
+  }
+}
+
+sub compute_hostlist {
+  for my $arg (@ARGV) {
+    my ( $host, $service ) = split( qr{/}, $arg );
+
+    if ( not any { $host } @for_hosts ) {
+      push( @for_hosts, $host );
+    }
+    if ($service) {
+      push( @for_services, $service );
+    }
+  }
+
+  foreach my $host (@for_hosts) {
+    if ( not exists $data->{services}->{$host} ) {
+      die("Unknown host: ${host}\n");
+    }
+  }
+
+  @list_hosts    = @for_hosts;
+  @list_services = @for_services;
+
+  foreach my $group (@for_groups) {
+    if ( not exists $config->{'hostgroups'}->{$group} ) {
+      die("Unknown hostgroup: ${group}\n");
+    }
+    foreach
+      my $host ( split /,/, $config->{'hostgroups'}->{$group}->{'members'} )
+    {
+      if ( not any { $_ eq $host } @list_hosts ) {
+        push( @list_hosts, $host );
+      }
+    }
+      }
+
+  if ( @list_hosts == 0 ) {
+    @list_hosts = sort keys %{ $data->{hosts} };
+      }
+
+  if (@list_services) {
+    @list_hosts
+      = grep { have_service_multi( $_, @list_services ) } @list_hosts;
+    }
+
+  if ( $list_type eq 'h' ) {
+    @list_hosts
+      = grep { filter_host( $data->{'hosts'}->{$_} ) } @list_hosts;
+  }
+}
+
 sub service_state {
-  my ($s) = @_;
+  my ($s)     = @_;
   my $checked = $s->{has_been_checked};
-  my $digit = $s->{current_state};
+  my $digit   = $s->{current_state};
 
   if ( not $checked ) {
     return 'PENDING ';
   }
 
   given ($digit) {
-    when (0) { return with_colour( '  OK  ', 'black on_green' ) }
-    when (1) { return with_colour( ' WARN ', 'black on_yellow' ) }
-    when (2) { return with_colour( ' CRIT ', 'white on_red' ) }
-    when (3) { return with_colour( ' UNKN ', 'white on_blue' ) }
-    default  { croak("Unknown service state: $digit\n") }
+    when (0) { return with_colour( '   OK   ', 'black on_green' ) }
+    when (1) { return with_colour( ' WARNING', 'black on_yellow' ) }
+    when (2) { return with_colour( 'CRITICAL', 'white on_red' ) }
+    when (3) { return with_colour( ' UNKNOWN', 'white on_blue' ) }
+    default { croak("Unknown service state: $digit\n") }
   }
 }
 
 sub host_state {
-  my ( $h ) = @_;
+  my ($h)     = @_;
   my $checked = $h->{has_been_checked};
-  my $digit = $h->{current_state};
+  my $digit   = $h->{current_state};
 
   if ( not $checked ) {
     return '  PENDING  ';
@@ -461,9 +746,19 @@ sub display_queue {
     );
 
   @queue = grep { $_->{host_name} ~~ \@list_hosts } @queue;
+  if ($as_contact) {
+    @queue = grep {
+      exists $_->{service_description}
+        ? service_has_contact( $_, $as_contact )
+        : host_has_contact( $_, $as_contact )
+    } @queue;
+  }
 
   if (@list_services) {
     @queue = grep { $_->{service_description} ~~ \@list_services } @queue;
+    if ($as_contact) {
+      @queue = grep { host_has_contact( $_, $as_contact ) } @queue;
+  }
   }
 
   printf( "%-25.25s  %-20.20s  %-19s  %-19s\n",
@@ -486,25 +781,82 @@ sub display_queue {
 }
 
 sub display_downtime {
-  my ($d) = @_;
-  my $v = $verbosity;
+  my ($d)    = @_;
+  my $v      = $verbosity;
+  my $format = "%-10s : %s\n";
 
-  printf( '%-27.27s', $d->{'host_name'} );
+  if ( $v > 2 ) {
+    printf( $format, 'Host', $d->{host_name} );
+    if ( $d->{service_description} ) {
+      printf( $format, 'Service', $d->{service_description} );
+    }
+    printf( $format,
+      'Start',
+      $d->{is_in_effect}
+      ? with_colour( pretty_date( $d->{start_time} ), 'bold' )
+      : pretty_date( $d->{start_time} ) );
+    printf( $format,
+      'End',
+      $d->{is_in_effect}
+      ? with_colour( pretty_date( $d->{end_time} ), 'bold' )
+      : pretty_date( $d->{end_time} ) );
+    printf( $format,
+      'Duration',
+      $d->{fixed} ? 'Fixed' : pretty_duration_abs( $d->{duration} ) );
+    if ( $v > 3 ) {
+      printf( $format, 'ID', $d->{downtime_id} );
+      if ( $d->{trigger_time} ) {
+        printf( $format,
+          'Trigger',
+          $d->{triggered_by}
+            . ' (active since '
+            . pretty_date( $d->{trigger_time} )
+            . ')' );
+      }
+      else {
+        printf( $format, 'Trigger', $d->{triggered_by} || 'None' );
+      }
+    }
+    printf( $format, 'Author', $d->{author} );
+    printf( $format, 'Comment', break_str( $d->{comment}, 19 ) );
+  }
+  else {
+
+    if ( $d->{service_description} ) {
+      printf( '%-25.25s %-25.25s',
+        $d->{'host_name'}, $d->{service_description} );
+    }
+    else {
+      printf( '%-25.25s', $d->{'host_name'} );
+    }
 
   if ( $v >= 3 ) {
     printf( ' %s %-10.10s',
       pretty_date( $d->{'entry_time'} ),
       $d->{'author'}, );
   }
-  if ( $v >= 2 ) {
-    printf( ' %-30.30s', $d->{'comment'} );
+    if ( $d->{is_in_effect} ) {
+      printf( ' %-28s %-28s',
+        with_colour( pretty_date( $d->{'start_time'} ), 'bold' ),
+        with_colour( pretty_date( $d->{'end_time'} ),   'bold' ),
+      );
   }
-  printf( ' %s %s',
+    else {
+      printf(
+        ' %-20.20s %-20.20s',
     pretty_date( $d->{'start_time'} ),
     pretty_date( $d->{'end_time'} ),
   );
+    }
   if ( $v >= 2 ) {
-    print( $d->{'fixed'} ? ' Fixed' : ' Flexi' );
+      printf( '%-17.17s',
+        $d->{'fixed'}
+        ? ' Fixed'
+        : q{ } . pretty_duration_abs( $d->{duration} ) );
+    }
+    if ( $v >= 2 ) {
+      print( $d->{comment} );
+    }
   }
 
   print "\n";
@@ -534,7 +886,7 @@ sub display_x_verbose {
       printf(
         "%-16s : %s (for %s)%s\n",
         'Status',
-        host_state( $x ),
+        host_state($x),
         pretty_duration( $x->{'last_state_change'} ),
         (
           $x->{'problem_has_been_acknowledged'}
@@ -623,6 +975,10 @@ sub display_x_verbose {
       'Flap Detection',
       pretty_yesno( $x->{'flap_detection_enabled'} ),
     );
+
+    for my $c ( @{ $x->{comments} // [] } ) {
+      printf( $format, 'Comment', break_str( $c->{comment_data}, 19 ) );
+}
   }
 }
 
@@ -673,15 +1029,14 @@ sub display_service {
       print with_colour( $flags, 'bold' );
     }
 
-    printf( ' %s',
-      service_state( $s) );
+    printf( ' %s', service_state($s) );
 
     if ( $v >= 2 ) {
       printf( ' %d/%d', $s->{'current_attempt'}, $s->{'max_attempts'} );
       $n_width += 4;
     }
 
-    print ' ';
+    print q{ };
     printf( '%-6.6s', substr $s->{'_TCS3_PRIORITY'},2);
     $n_width += 7;
     print ' ';
@@ -705,23 +1060,25 @@ sub display_host_services {
 
   if ( $all and @services and $verbosity < 3 ) {
 
-    if ( $h->{'current_state'} ) {
       print "\n$host";
+
+    if ( $h->{'current_state'} ) {
       print q{ };
+    }
       if ( $h->{'current_state'} == 1 ) {
         print with_colour( 'DOWN', 'white on_red' );
       }
       elsif ( $h->{'current_state'} == 2 ) {
         print with_colour( 'UNREACHABLE', 'white on_blue' );
       }
+
       print "\n";
     }
-  }
 
   foreach my $service (@services) {
 
     if ( $all and $verbosity < 3 ) {
-      print "";
+      print "\t";
     }
     elsif ($all) {
       print "\n";
@@ -739,9 +1096,7 @@ sub display_host_single {
 
   if ( $v < 3 ) {
 
-    printf( '%-32.32s %s',
-      $h->{host_name},
-      host_state( $h ) );
+    printf( '%-32.32s %s', $h->{host_name}, host_state($h) );
 
     if ( $v >= 2 ) {
       printf( ' %d/%d', $h->{'current_attempt'}, $h->{'max_attempts'} );
@@ -769,45 +1124,59 @@ sub display_host {
 
 sub display_host_overview {
   my ($host) = @_;
-  my ($ok, $warn, $crit, $unk) = (0) x 4;
+  my ( $ok, $warn, $crit, $unk, $pend ) = (0) x 5;
   my $h = $data->{hosts}->{$host};
 
   my @services = grep { filter_service($_) } @{ $data->{services}->{$host} };
 
   for my $s (@services) {
-    given ($s->{current_state}) {
+    if ( $s->{has_been_checked} == 0 ) {
+      $pend++;
+    }
+    else {
+      given ( $s->{current_state} ) {
       when (0) { $ok++ }
       when (1) { $warn++ }
       when (2) { $crit++ }
       when (3) { $unk++ }
+  }
     }
   }
 
-  printf('%-32.32s %s',
-    $h->{host_name},
-    host_state($h ) );
+  printf( '%-32.32s %s', $h->{host_name}, host_state($h) );
 
-  printf('  %s  %s  %s  %s',
-    pretty_state($ok, 'ok'),
-    pretty_state($warn, 'warning'),
-    pretty_state($crit, 'critical'),
-    pretty_state($unk, 'unknown'),
+  printf(
+    '  %s  %s  %s  %s  %s',
+    pretty_state( $ok,   'ok' ),
+    pretty_state( $warn, 'warning' ),
+    pretty_state( $crit, 'critical' ),
+    pretty_state( $unk,  'unknown' ),
+    pretty_state( $pend, 'pending' ),
   );
 
   print "\n";
 }
 
 sub display_overview {
-  my ($h_ok, $h_d, $h_u, $s_ok, $s_w, $s_c, $s_u) = (0) x 7;
+  my ( $h_ok, $h_d, $h_u, $h_p, $s_ok, $s_w, $s_c, $s_u, $s_p ) = (0) x 9;
 
   for my $h (@list_hosts) {
-    given ($data->{hosts}{$h}{current_state}) {
+    if ( $data->{hosts}{$h}{has_been_checked} == 0 ) {
+      $h_p++;
+    }
+    else {
+      given ( $data->{hosts}{$h}{current_state} ) {
       when (0) { $h_ok++ }
       when (1) { $h_d++ }
       when (2) { $h_u++ }
     }
-    for my $s (grep { filter_service($_) } @{ $data->{services}{$h} }) {
-      given ($s->{current_state}) {
+    }
+    for my $s ( grep { filter_service($_) } @{ $data->{services}{$h} } ) {
+      if ( $s->{has_been_checked} == 0 ) {
+        $s_p++;
+      }
+      else {
+        given ( $s->{current_state} ) {
         when (0) { $s_ok++ }
         when (1) { $s_w++ }
         when (2) { $s_c++ }
@@ -815,85 +1184,133 @@ sub display_overview {
       }
     }
   }
+  }
 
-  printf("%-16.16s  %4s\n", 'total hosts', $h_ok + $h_d + $h_u);
-  printf("%-16.16s  %s\n", 'up', pretty_state($h_ok, 'ok'));
-  printf("%-16.16s  %s\n", 'down', pretty_state($h_d, 'critical'));
-  printf("%-16.16s  %s\n", 'unreachable', pretty_state($h_u, 'unknown'));
+  printf( "%-16.16s  %4s\n", 'total hosts', $h_ok + $h_d + $h_u );
+  printf( "%-16.16s  %s\n", 'up', pretty_state( $h_ok, 'ok' ) );
+  printf( "%-16.16s  %s\n", 'down', pretty_state( $h_d, 'critical' ) );
+  printf( "%-16.16s  %s\n", 'unreachable', pretty_state( $h_u, 'unknown' ) );
+  printf( "%-16.16s  %s\n", 'pending',     pretty_state( $h_p, 'pending' ) );
   print "\n";
-  printf("%-16.16s  %4s\n", 'total services', $s_ok + $s_w + $s_c + $s_u);
-  printf("%-16.16s  %s\n", 'ok', pretty_state($s_ok, 'ok'));
-  printf("%-16.16s  %s\n", 'warning', pretty_state($s_w, 'warning'));
-  printf("%-16.16s  %s\n", 'critical', pretty_state($s_c, 'critical'));
-  printf("%-16.16s  %s\n", 'unknown', pretty_state($s_u, 'unknown'));
+  printf( "%-16.16s  %4s\n", 'total services', $s_ok + $s_w + $s_c + $s_u );
+  printf( "%-16.16s  %s\n", 'ok', pretty_state( $s_ok, 'ok' ) );
+  printf( "%-16.16s  %s\n", 'warning', pretty_state( $s_w, 'warning' ) );
+  printf( "%-16.16s  %s\n", 'critical', pretty_state( $s_c, 'critical' ) );
+  printf( "%-16.16s  %s\n", 'unknown',  pretty_state( $s_u, 'unknown' ) );
+  printf( "%-16.16s  %s\n", 'pending',  pretty_state( $s_p, 'pending' ) );
 }
-
 
 sub dispatch_command {
   my $str = join( ';', @_ );
 
-  open( my $cmd_fh, '>', $rw_file );
+  open( my $cmd_fh, '>', $rw_file )
+    or die( "Failed to open icinga command file ($rw_file): $!\n"
+      . "Set --rw-file to change it\n" );
   printf $cmd_fh ( '[%d] %s', time(), $str, );
-  close($cmd_fh);
-}
-
-sub recheck_host_all {
-  my ($host) = @_;
-
-  dispatch_command( 'SCHEDULE_HOST_SVC_CHECKS', $host, time() );
-  say "Scheduled check of * on '$host'";
-}
-
-sub recheck_service {
-  my ( $host, $service ) = @_;
-
-  dispatch_command( 'SCHEDULE_SVC_CHECK', $host, $service, time() );
-  say "Scheduled check of '$service' on '$host'";
-}
-
-sub force_recheck_service {
-  my ( $host, $service ) = @_;
-
-  dispatch_command( 'SCHEDULE_FORCED_SVC_CHECK', $host, $service, time() );
-  say "Scheduled forced check of '$service' on '$host'";
-}
-
-sub acknowledge_service {
-  my ( $host, $service ) = @_;
-
-  dispatch_command( 'ACKNOWLEDGE_SVC_PROBLEM', $host, $service, 2, 1, 1,
-    'cli', $acknowledge );
-  say "Acknowledged $host/$service: $acknowledge";
+  close($cmd_fh)
+    or warn("Failed to close $rw_file: $!\n");
 }
 
 sub action_on_host {
-  my ($h) = @_;
+  my ($host) = @_;
 
-  if ($recheck) {
-    recheck_host_all($h);
+  my $tz = DateTime::TimeZone->new( name => 'local' );
+
+  given ($action) {
+    when ('downtime') {
+      my ( $start, $end, $duration, $comment, @opts ) = @action_args;
+      my $strp = DateTime::Format::Strptime->new(
+        pattern   => '%Y-%m-%dT%H:%M:%S',
+        time_zone => $tz->name,
+      );
+
+      my $dt_start = $strp->parse_datetime($start);
+      my $dt_end   = $strp->parse_datetime($end);
+      my $fixed    = $duration ? 0 : 1;
+      my $command  = 'SCHEDULE_HOST_DOWNTIME';
+      my $addendum = q{};
+
+      $duration = parse_duration($duration);
+
+      if ( 'children' ~~ \@opts ) {
+        $command  = 'SCHEDULE_AND_PROPAGATE_HOST_DOWNTIME';
+        $addendum = ' and its children';
+}
+      if ( 'trigger_children' ~~ \@opts ) {
+        $command  = 'SCHEDULE_AND_PROPAGATE_TRIGGERED_HOST_DOWNTIME';
+        $addendum = ' and its children (triggered)';
+}
+
+      dispatch_command( $command, $host, $dt_start->epoch, $dt_end->epoch,
+        $fixed, 0, $duration, 'cli', $comment );
+      say "Scheduled host downtime for '$host'$addendum";
+    }
+    when ('recheck') {
+  dispatch_command( 'SCHEDULE_HOST_SVC_CHECKS', $host, time() );
+  say "Scheduled check of * on '$host'";
+}
+    when ('force_recheck') {
+      dispatch_command( 'SCHEDULE_FORCED_HOST_SVC_CHECKS', $host,
+        time() );
+      say "Scheduled forced check of * on '$host'";
+    }
+    default {
+      say STDERR "Cannot run action '${action}' on a host"
   }
+}
 }
 
 sub action_on_service {
-  my ( $h, $s ) = @_;
+  my ( $host, $service ) = @_;
 
-  if ( not have_service( $h, $s ) ) {
+  if ( not have_service( $host, $service ) ) {
     return;
   }
 
-  if ($recheck) {
-    recheck_service( $h, $s );
+  my $tz = DateTime::TimeZone->new( name => 'local' );
+
+  given ($action) {
+    when ('downtime') {
+      my ( $start, $end, $duration, $comment, @opts ) = @action_args;
+      my $strp = DateTime::Format::Strptime->new(
+        pattern   => '%Y-%m-%dT%H:%M:%S',
+        time_zone => $tz->name,
+      );
+
+      my $dt_start = $strp->parse_datetime($start);
+      my $dt_end   = $strp->parse_datetime($end);
+      my $fixed    = $duration ? 0 : 1;
+
+      $duration = parse_duration($duration);
+
+      dispatch_command( 'SCHEDULE_SVC_DOWNTIME', $host, $service,
+        $dt_start->epoch, $dt_end->epoch,
+        $fixed, 0, $duration, 'cli', $comment );
+      say "Scheduled service downtime for '$service' on '$host'";
   }
-  if ($force_recheck) {
-    force_recheck_service( $h, $s );
+    when ('recheck') {
+      dispatch_command( 'SCHEDULE_SVC_CHECK', $host, $service, time() );
+      say "Scheduled check of '$service' on '$host'";
   }
-  if ($acknowledge) {
-    acknowledge_service( $h, $s );
+    when ('force_recheck') {
+      dispatch_command( 'SCHEDULE_FORCED_SVC_CHECK', $host, $service,
+        time() );
+      say "Scheduled forced check of '$service' on '$host'";
+  }
+    when ('Acknowledge') {
+      dispatch_command( 'ACKNOWLEDGE_SVC_PROBLEM', $host, $service, 2, 1,
+        1, 'cli', $action_args[0] );
+      say "Acknowledged $host/$service: $action_args[0]";
+  }
+    default {
+      say STDERR "Cannot run action '${action}' on a service"
+  }
   }
 }
 
 GetOptions(
-  'a|acknowledge=s' => sub { $acknowledge = $_[1]; $list_type = q{} },
+  'api1=s'          => \$api1_root,
+  'a|action=s'      => \$action,
   'c|config=s'      => \$config_file,
   'C|no-colours'    => sub { $colours = 0 },
   'f|status-file=s' => \$status_file,
@@ -901,71 +1318,59 @@ GetOptions(
   'g|hostgroup=s'   => sub { push( @for_groups, split( /,/, $_[1] ) ) },
   'h|host=s'        => sub { push( @for_hosts, split( /,/, $_[1] ) ) },
   'l|list=s'        => sub { $list_type = substr( $_[1], 0, 1 ) },
-  'm|match=s'       => sub { $match_output = qr{$_[1]}i },
-  'o|overview'      => \$overview,
-  'r|recheck'       => sub { $recheck = 1; $list_type = q{} },
-  's|service=s' => sub { push( @for_services, split( /,/, $_[1] ) ) },
-  'u|force-recheck' => sub { $force_recheck = 1; $list_type = q{} },
-  'U|as-contact=s'  => \$as_contact,
-  'v|verbose+' => \$verbosity,
+  'm|match=s' => sub { $match_output = qr{$_[1]}i },
+  'o|overview'     => \$overview,
+  'realm=s'        => \$realm,
+  's|service=s'    => sub { push( @for_services, split( /,/, $_[1] ) ) },
+  'U|as-contact=s' => \$as_contact,
+  'v|verbose+'     => \$verbosity,
   'V|version' => sub { say "icli version $VERSION"; exit 0 },
   'x|cut-mode=s' => sub { $cut_mode = substr( $_[1], 0, 1 ) },
   'z|filter=s' => sub { push( @filters, split( /,/, $_[1] ) ) },
 ) or die("Please see perldoc -F $0 for help\n");
 
-read_objects( $status_file, \$data );
-read_objects( $config_file, \$config );
-enhance_status();
+if ($api1_root) {
+  setup_ua($api1_root);
 
-for my $arg (@ARGV) {
-  my ( $host, $service ) = split( qr{/}, $arg );
+  my $config_url = "$api1_root/config.cgi?jsonoutput&type=all";
+  my $hdata_url  = "$api1_root/status.cgi?jsonoutput&style=hostdetail";
+  my $sdata_url  = "$api1_root/status.cgi?jsonoutput";
 
-  if ( not any { $host } @for_hosts ) {
-    push( @for_hosts, $host );
-  }
-  if ($service) {
-    push( @for_services, $service );
-  }
-}
+  my $config_res = $ua->get($config_url);
+  my $hdata_res  = $ua->get($hdata_url);
+  my $sdata_res  = $ua->get($sdata_url);
 
-foreach my $host (@for_hosts) {
-  if ( not exists $data->{services}->{$host} ) {
-    die("Unknown host: ${host}\n");
-  }
-}
-
-@list_hosts    = @for_hosts;
-@list_services = @for_services;
-
-foreach my $group (@for_groups) {
-  if ( not exists $config->{'hostgroups'}->{$group} ) {
-    die("Unknown hostgroup: ${group}\n");
-  }
-  foreach
-    my $host ( split /,/, $config->{'hostgroups'}->{$group}->{'members'} )
+  for my $request (
+    [ $config_url, $config_res ],
+    [ $hdata_url,  $hdata_res ],
+    [ $sdata_url,  $sdata_res ]
+    )
   {
-    if ( not any { $_ eq $host } @list_hosts ) {
-      push( @list_hosts, $host );
-    }
+    my ( $url, $res ) = @{$request};
+    if ( $res->is_error ) {
+      die( "Error while requesting $url\nError description:\n\n"
+          . $res->as_string );
   }
 }
 
-if ( @list_hosts == 0 ) {
-  @list_hosts = sort keys %{ $data->{services} };
+  read_json( $config_res, \$config );
+  read_json( $hdata_res,  \$data );
+  read_json( $sdata_res,  \$data );
+}
+else {
+  read_objects( $status_file, \$data, 'icinga status_file', '--status-file' );
+  read_objects( $config_file, \$config, 'icinga object_cache_file',
+    '--config' );
 }
 
-if (@list_services) {
-  @list_hosts = grep { have_service_multi( $_, @list_services ) } @list_hosts;
-}
+enhance_status();
+parse_action();
+compute_hostlist();
 
+if ($overview) {
 if ( $list_type eq 'h' ) {
-  @list_hosts = grep { filter_host( $data->{'hosts'}->{$_} ) } @list_hosts;
-}
-
-if ( $overview ) {
-  if ($list_type eq 'h') {
     for my $host (@list_hosts) {
-      display_host_overview( $host );
+      display_host_overview($host);
     }
   }
   else {
@@ -981,11 +1386,41 @@ elsif ( $list_type eq 'q' ) {
   display_queue();
 }
 elsif ( $list_type eq 'd' ) {
+  if ( exists $data->{hostdowntimes} ) {
+    say 'Host downtimes:';
+    if ( $verbosity == 1 ) {
+      printf( "%-25.25s %-20.20s %-20.20s\n", 'Host', 'start', 'stop' );
+    }
+    elsif ( $verbosity == 2 ) {
+      printf( "%-25.25s %-20.20s %-20.20s %-17.17s %s\n",
+        'Host', 'start', 'stop', 'duration', 'comment' );
+    }
   foreach my $downtime ( @{ $data->{hostdowntimes} } ) {
     display_downtime($downtime);
   }
 }
-elsif ( $recheck or $acknowledge ) {
+  else {
+    say 'No host downtimes';
+  }
+  if ( exists $data->{servicedowntimes} ) {
+    say "\nService downtimes:";
+    if ( $verbosity == 1 ) {
+      printf( "%-25.25s %-25.25s %-20.20s %-20.20s\n",
+        'Host', 'Service', 'start', 'stop' );
+    }
+    elsif ( $verbosity == 2 ) {
+      printf( "%-25.25s %-25.25s %-20.20s %-20.20s %-17.17s %s\n",
+        'Host', 'Service', 'start', 'stop', 'duration', 'comment' );
+    }
+    foreach my $downtime ( @{ $data->{servicedowntimes} } ) {
+    display_downtime($downtime);
+    }
+  }
+  else {
+    say "\nNo service downtimes";
+  }
+}
+elsif ($action) {
 
   foreach my $host (@list_hosts) {
     if ( not @list_services and not @filters ) {
@@ -1017,14 +1452,14 @@ B<icli> - Icinga Command Line Interface
 
 =head1 SYNOPSIS
 
-B<icli> [B<-v>|B<-vv>] [B<-z> I<filter>] [B<-h> I<hosts>] [B<-g> I<hostgroups>]
+B<icli> [B<-v>|B<-vv>|B<-vvv>] [B<-z> I<filter>] [B<-h> I<hosts>] [B<-g> I<hostgroups>]
 [B<-s> I<services>] [B<-c> I<config>] [B<-C>] [B<-f> I<status-file>]
-[B<-F> I<rw-file>] [B<-r>|B<-u>|B<-lh>|B<-ls>|B<-lq>|B<-ld>]
+[B<-F> I<rw-file>] [B<-lh>|B<-ls>|B<-lq>|B<-ld>] [B<-a> I<action>[B<:>I<args>]]
 [I<host>/I<service> I<...>]
 
 =head1 VERSION
 
-version 0.43
+version 0.48
 
 =head1 DESCRIPTION
 
@@ -1047,18 +1482,59 @@ aneurysm/{Libraries,Websites} >> with shell expansion).
 
 =over
 
-=item B<-a>|B<--acknowledge> I<comment>
+=item B<-a>|B<--action> I<action>[:I<args>]
 
-Acknowledge all matching services with string I<comment>. This creates a sticky
+Run I<action> on all matching hosts or services. I<args> is a comma-separated
+list of action arguments and depends on the action in question. I<action> may
+also be a one or two letter shortcut.
+
+The following actions are supported:
+
+=over
+
+=item a|acknowledge I<comment>
+
+Acknowledge service problems with string I<comment>. This creates a sticky
 acknwoledgment with notification and no expire time. The comment will not be
 persistent.
 
 Note: Acknowledgement of host problems is not yet supported.
 
+=item d|downtime I<start>,I<stop>,I<duration>,I<comment>[,I<opts>]
+
+Schedule a non-triggered host or service (depending on the filter arguments)
+downtime.  I<start> and I<stop> are timestamps and must be formatted as
+YYYY-MM-DDTHH:MM:SS, where the "T" is literal. The timestamp is assumed to
+be in the same time zone as the system running icli.
+
+If I<duration> is 0 (zero), a fixed downtime between I<start> and I<stop>
+is scheduled. Otherwise, a flexible downtime which will start between
+I<start> and I<stop> and last I<duration> is scheduled. In this case,
+I<duration> must be a real number appended with an optional unit
+(s for seconds, m for minutes, h for hours, d for days, w for weeks). If no
+unit is specified, seconds are used.
+
+If a host is selected and I<opts> contains "children", a downtime for all of
+its children will be scheduled with the same parameters as the host's.
+Likewise, if I<opts> contains "trigger_children", a triggered downtime for all
+of the host's children will be scheduled.
+
+I<comment> refers to the downtime's comment field and must not contain the
+"," (comma) character.
+
+=item r|recheck
+
+Schedule an immediate recheck
+
+=item R|force_recheck
+
+Schedule a forced, immediate recheck
+
+=back
+
 =item B<-c>|B<--config> I<config>
 
-Read config from I<file> instead of the default
-F</var/cache/icinga/objects.cache>
+Read config from I<file>
 
 =item B<-C>|B<--no-colours>
 
@@ -1066,13 +1542,11 @@ Disable colours in output
 
 =item B<-f>|B<--status-file> I<file>
 
-Read the status from I<file> instead of the default
-F</var/lib/icinga/status.dat>
+Read the status from I<file>
 
 =item B<-F>|B<--rw-file> I<file>
 
-Use I<file> as external commands file. Default:
-F</var/lib/icinga/rw/icinga.cmd>
+Use I<file> as external commands file.
 
 =item B<-g>|B<--hostgroup> I<hostgroup>
 
@@ -1102,18 +1576,9 @@ By default (or when used with C<< -ls >>) the number of all hosts and services
 When used with C<< -lh >>, lists all hosts with the number of ok / warning /
 ... checks on each host.
 
-=item B<-r>|B<--recheck>
-
-Schedule an immediate recheck of all selected services
-
-=item B<-u>|B<--force-recheck>
-
-Schedule a forced, immediate recheck of all selected services
-
 =item B<-U>|B<--as-contact> I<name>
 
-Only operate on service visible to I<name>. Doesn't work for B<-lh> yet,
-most useful for B<-ls>.
+Only operate on service visible to I<name>.
 
 NOTE: This is meant to help find out which services a user has access to. It is
 NOT intended as a way to restrict access and should never be used that way.
@@ -1249,6 +1714,10 @@ Service state is Critical
 
 Service state is Unknown
 
+=item B<p>
+
+Host or service state is Pending
+
 =item B<d>
 
 Host state is Down
@@ -1273,7 +1742,11 @@ None.
 
 =item * autodie (included with perl >= 5.10.1)
 
-=item * Date::Format
+=item * DateTime
+
+=item * DateTime::Format::Strptime
+
+=item * DateTime::TimeZone
 
 =item * Term::Size
 
@@ -1281,8 +1754,11 @@ None.
 
 =head1 BUGS AND LIMITATIONS
 
-This software is in early development stages. So there will probably be quite
-a lot.
+It is probably not clear from the documentation when an action will operate
+on hosts and when on services.
+
+Note that this software is not yet stable. Command line options may be changed
+/ removed and thus break backwards compatibility at any time.
 
 =head2 REPORTING BUGS
 
